@@ -167,7 +167,7 @@ freeproc_thread(struct proc *p)
   // unmap this thread's trapframe mapping from the shared pagetable
   if (p->pagetable && p->trap_va)
   {
-    // 仅当该 trap_va 目前确有映射时才解除映射，避免 walk panic。
+    // 仅当该 trap_va 目前确有映射时才解除映射，避免 walk panic
     if (kwalkaddr(p->pagetable, p->trap_va) != 0)
       uvmunmap(p->pagetable, p->trap_va, PGSIZE, 0);
   }
@@ -175,7 +175,7 @@ freeproc_thread(struct proc *p)
   if (p->trapframe)
     kfree((void *)p->trapframe);
 
-  // clear fields; do not touch shared pagetable memory
+  // clear fields
   p->trapframe = 0;
   p->trap_va = 0;
   p->pagetable = 0;
@@ -281,13 +281,12 @@ int growproc(int n)
   {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
-  // 同步所有共享同一页表的线程/兄弟的 sz（包括自己）。
+  // 同步所有共享同一页表的线程的 sz（包括自己）
   p->sz = sz;
   for (struct proc *pp = proc; pp < &proc[NPROC]; pp++)
   {
     if (pp == p)
       continue;
-    // 同一地址空间（共享 pagetable）的线程/兄弟
     if (pp->state != UNUSED && pp->pagetable == p->pagetable)
     {
       acquire(&pp->lock);
@@ -383,7 +382,28 @@ void exit(int status)
   if (p == initproc)
     panic("init exiting");
 
-  // Close all open files.
+  // 线程与进程组长分离处理
+  if (p->is_thread)
+  {
+    struct proc *leader = p->tgroup;
+    if (leader)
+    {
+      acquire(&leader->lock);
+      wakeup1(leader);
+      release(&leader->lock);
+    }
+
+    // 置为 ZOMBIE 后直接进入调度器；按约定 sched 需要在持有 p->lock 的情况下调用
+    acquire(&p->lock);
+    p->xstate = status;
+    p->state = ZOMBIE;
+
+    // 不释放 p->lock，直接 sched 切走
+    sched();
+    panic("zombie exit (thread)");
+  }
+
+  // 仅在组长处关闭一次
   for (int fd = 0; fd < NOFILE; fd++)
   {
     if (p->ofile[fd])
@@ -399,35 +419,59 @@ void exit(int status)
   end_op();
   p->cwd = 0;
 
-  // we might re-parent a child to init. we can't be precise about
-  // waking up init, since we can't acquire its lock once we've
-  // acquired any other proc lock. so wake up init whether that's
-  // necessary or not. init may miss this wakeup, but that seems
-  // harmless.
   acquire(&initproc->lock);
   wakeup1(initproc);
   release(&initproc->lock);
 
-  // grab a copy of p->parent, to ensure that we unlock the same
-  // parent we locked. in case our parent gives us away to init while
-  // we're waiting for the parent lock. we may then race with an
-  // exiting parent, but the result will be a harmless spurious wakeup
-  // to a dead or wrong process; proc structs are never re-allocated
-  // as anything else.
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
+
+  // 在组长退出前，终结并收割所有同组线程，
+  for (;;)
+  {
+    int have_threads = 0;
+    int reaped_one = 0;
+    for (struct proc *np = proc; np < &proc[NPROC]; np++)
+    {
+      if (np == p)
+        continue;
+      if (np->is_thread && np->tgroup == p)
+      {
+        have_threads = 1;
+        acquire(&np->lock);
+        if (np->state == ZOMBIE)
+        {
+          // 解除其 trapframe 映射并释放其结构
+          freeproc_thread(np);
+          release(&np->lock);
+          reaped_one = 1;
+          continue;
+        }
+        // 请求仍在运行/睡眠的线程退出
+        np->killed = 1;
+        if (np->state == SLEEPING)
+          np->state = RUNNABLE;
+        release(&np->lock);
+      }
+    }
+    if (!have_threads)
+      break; // 无线程可处理
+    if (!reaped_one)
+    {
+      // 暂无可收割线程
+      sleep(p, &p->lock);
+    }
+  }
+
+  // parent-then-child 加锁顺序
   release(&p->lock);
 
-  // we need the parent's lock in order to wake it up from wait().
-  // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
 
   acquire(&p->lock);
 
-  // Give any children to init.
   reparent(p);
 
-  // Parent might be sleeping in wait().
   wakeup1(original_parent);
 
   p->xstate = status;
@@ -441,15 +485,13 @@ void exit(int status)
 }
 
 // Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
 int wait(uint64 addr)
 {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
 
-  // hold p->lock for the whole time to avoid lost
-  // wakeups from a child's exit().
+  // hold p->lock for the whole time to avoid lost wakeups from a child's exit().
   acquire(&p->lock);
 
   for (;;)
@@ -458,18 +500,13 @@ int wait(uint64 addr)
     havekids = 0;
     for (np = proc; np < &proc[NPROC]; np++)
     {
-      // this code uses np->parent without holding np->lock.
-      // acquiring the lock first would cause a deadlock,
-      // since np might be an ancestor, and we already hold p->lock.
       if (np->parent == p && np->is_thread == 0)
       {
-        // np->parent can't change between the check and the acquire()
-        // because only the parent changes it, and we're the parent.
         acquire(&np->lock);
         havekids = 1;
         if (np->state == ZOMBIE)
         {
-          // Found one.
+          // Found one
           pid = np->pid;
           if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
                                    sizeof(np->xstate)) < 0)
@@ -822,18 +859,12 @@ int clone(uint64 fcn, uint64 arg1, uint64 arg2, uint64 stack)
     return -1;
   }
 
-  // 释放 allocproc() 创建的临时用户页表。
-  // 防御式检查：仅当确实存在映射时才去取消映射，避免出现 "uvmunmap: walk" 的 panic。
-  if (kwalkaddr(np->pagetable, TRAMPOLINE) != 0)
-    uvmunmap(np->pagetable, TRAMPOLINE, PGSIZE, 0);
-  if (kwalkaddr(np->pagetable, TRAPFRAME) != 0)
-    uvmunmap(np->pagetable, TRAPFRAME, PGSIZE, 0);
-  uvmfree(np->pagetable, 0);
+  // 释放allocproc创建的临时用户页表
+  proc_freepagetable(np->pagetable, 0);
   np->pagetable = p->pagetable;
   np->sz = p->sz;
 
-  // Pick a unique virtual address to map this thread's trapframe.
-  // Scan downward from TRAPFRAME until we find an unmapped page.
+  // Pick a unique virtual address to map this thread's trapframe
   uint64 tfva = TRAPFRAME;
   while (kwalkaddr(p->pagetable, tfva) != 0)
   {
@@ -858,16 +889,15 @@ int clone(uint64 fcn, uint64 arg1, uint64 arg2, uint64 stack)
   }
   np->trap_va = tfva;
 
-  // Initialize user registers from parent then override entry, args, and stack.
+  // Init
   *(np->trapframe) = *(p->trapframe);
   np->trapframe->epc = fcn;
   np->trapframe->a0 = arg1;
   np->trapframe->a1 = arg2;
-  // Stack grows down; align to 16 bytes for RISC-V ABI.
+
   uint64 sp = (stack + PGSIZE) & ~((uint64)16 - 1);
   np->trapframe->sp = sp;
 
-  // Optionally duplicate open files & cwd as in fork.
   for (i = 0; i < NOFILE; i++)
     if (p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
@@ -875,7 +905,6 @@ int clone(uint64 fcn, uint64 arg1, uint64 arg2, uint64 stack)
 
   safestrcpy(np->name, p->name, sizeof(np->name));
 
-  // Thread metadata: mark as thread, set group leader and parent to leader.
   np->is_thread = 1;
   np->tgroup = p->is_thread ? p->tgroup : p;
   np->parent = np->tgroup; // join() 在组长处统一收割
@@ -887,7 +916,7 @@ int clone(uint64 fcn, uint64 arg1, uint64 arg2, uint64 stack)
   return pid;
 }
 
-// Wait for a thread (child of the same thread group) to exit.
+// Wait for a thread (child of the same thread group) to exit
 int join(uint64 ustackptr)
 {
   struct proc *self = myproc();
@@ -896,7 +925,7 @@ int join(uint64 ustackptr)
   int have_threads;
   int pid;
 
-  // 用组长的锁来承接睡眠/唤醒（exit 会唤醒 parent=leader）
+  // 用组长的锁来唤醒
   acquire(&leader->lock);
   for (;;)
   {
@@ -912,6 +941,7 @@ int join(uint64 ustackptr)
         if (np->state == ZOMBIE)
         {
           pid = np->pid;
+
           // 把栈基地址拷回用户 *stack
           if (ustackptr != 0)
           {
